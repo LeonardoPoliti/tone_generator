@@ -171,17 +171,22 @@ def plot_diagnostics(mono: np.ndarray, sr: int, title: str) -> None:
     mag = 20 * np.log10(np.maximum(np.abs(spec), 1e-12))
     mag -= mag.max()
 
+    peak_idx = np.argmax(mag)
+    peak_freq = freqs[peak_idx]
+
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4))
     ax1.plot(np.arange(n) / sr * 1000.0, mono, linewidth=0.8)
     ax1.set(title="Waveform / envelope", xlabel="Time (ms)", ylabel="Amplitude")
     ax2.plot(freqs, mag, linewidth=0.8)
+    ax2.axvline(peak_freq, color="red", linewidth=0.8, linestyle="--")
+    ax2.annotate(f"{peak_freq:.1f} Hz", xy=(peak_freq, 0), xytext=(5, -8),
+                textcoords="offset points", color="red", fontsize=9)
     ax2.set(title="Magnitude spectrum", xlabel="Frequency (Hz)", ylabel="dB (rel. peak)")
     ax2.set_xlim(0, min(sr / 2, 6000))
     ax2.set_ylim(-100, 5)
-    fig.suptitle(title)
+    fig.suptitle(f"{title}")
     fig.tight_layout()
     plt.show()
-
 
 def default_filename(a: argparse.Namespace, dur: float, r_in: float, r_out: float) -> str:
     ramp = (f"{fmt_num(r_in)}msramp" if r_in == r_out
