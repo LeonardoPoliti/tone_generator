@@ -1,4 +1,4 @@
-# tone_generator
+# Tone Generator
 
 Generates a short tone with clean
 raised-cosine on/off ramps and saves it as WAV or MP3.
