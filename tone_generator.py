@@ -7,12 +7,15 @@ Generates a short tone with raised-cosine on/off ramps and saves it as WAV
 
 Features:
   - sine, square, triangle (band-limited, alias-free), or noise waveform
+  - multi-tone / harmonic complex: sum several carriers (--freq 440 554 659)
+  - sinusoidal amplitude modulation (SAM): --am-freq / --am-depth
   - Hann (raised-cosine) onset/offset ramps, independently settable
   - level in dBFS, targeted as peak or RMS
   - mono or stereo, optional second sync/trigger channel
   - leading/trailing silence padding
   - WAV (16/24-bit) always available; MP3 export via pydub (lazy import)
   - 10 s calibration tone at the same freq/level
+  - optional JSON file with parameters/timing (--metadata)
   - optional envelope + spectrum plot
 
 Defaults: 750 Hz, 75 ms, 10 ms ramps, -12 dBFS peak, mono, 44.1 kHz, 16-bit.
@@ -51,32 +54,39 @@ def fmt_num(x: float) -> str:
     return s.replace(".", "p").replace("-", "neg")
 
 
-def generate_carrier(freq: float, n: int, sr: int, waveform: str,
-                     rng: np.random.Generator) -> np.ndarray:
-    """Unit-peak carrier. Square/triangle are band-limited (additive, harmonics
-    below Nyquist only) so they contain no aliased inharmonic energy."""
+def generate_carrier(freqs: list[float], n: int, sr: int, waveform: str,
+                     rng: np.random.Generator, am_freq: float | None = None,
+                     am_depth: float = 1.0) -> np.ndarray:
+    """Unit-peak carrier. For tonal waveforms, sums one component per entry in
+    `freqs` (multi-tone / harmonic complex). Square/triangle are band-limited
+    (additive, harmonics below Nyquist only) so they contain no aliased
+    inharmonic energy. Optional sinusoidal amplitude modulation (SAM),
+    (1 + am_depth * sin(2*pi*am_freq*t)), is applied before peak normalization."""
     t = np.arange(n, dtype=np.float64) / sr
     nyquist = sr / 2.0
 
-    if waveform == "sine":
-        return np.sin(2 * np.pi * freq * t)
-
     if waveform == "noise":
         x = rng.standard_normal(n)
-
-    elif waveform in ("square", "triangle"):
-        if freq >= nyquist:
-            sys.exit(f"Error: --freq {freq:g} Hz is at or above Nyquist ({nyquist:g} Hz).")
-        x = np.zeros(n, dtype=np.float64)
-        k = 1
-        while k * freq < nyquist:
-            if waveform == "square":
-                x += np.sin(2 * np.pi * k * freq * t) / k
-            else:
-                x += ((-1) ** ((k - 1) // 2)) * np.sin(2 * np.pi * k * freq * t) / (k * k)
-            k += 2
     else:
-        raise ValueError(f"Unknown waveform: {waveform}")
+        x = np.zeros(n, dtype=np.float64)
+        for freq in freqs:
+            if waveform == "sine":
+                x += np.sin(2 * np.pi * freq * t)
+            elif waveform in ("square", "triangle"):
+                if freq >= nyquist:
+                    sys.exit(f"Error: --freq {freq:g} Hz is at or above Nyquist ({nyquist:g} Hz).")
+                k = 1
+                while k * freq < nyquist:
+                    if waveform == "square":
+                        x += np.sin(2 * np.pi * k * freq * t) / k
+                    else:
+                        x += ((-1) ** ((k - 1) // 2)) * np.sin(2 * np.pi * k * freq * t) / (k * k)
+                    k += 2
+            else:
+                raise ValueError(f"Unknown waveform: {waveform}")
+
+    if am_freq is not None:
+        x = x * (1.0 + am_depth * np.sin(2 * np.pi * am_freq * t))
 
     peak = np.max(np.abs(x))
     return x / peak if peak > 0 else x
@@ -95,11 +105,13 @@ def make_envelope(n_total: int, n_in: int, n_out: int) -> np.ndarray:
     return env
 
 
-def build_tone(freq: float, n_total: int, n_in: int, n_out: int, sr: int,
+def build_tone(freqs: list[float], n_total: int, n_in: int, n_out: int, sr: int,
                waveform: str, amplitude_db: float, level_mode: str,
-               rng: np.random.Generator) -> np.ndarray:
+               rng: np.random.Generator, am_freq: float | None = None,
+               am_depth: float = 1.0) -> np.ndarray:
     """Ramped tone scaled so that its peak (or RMS) equals amplitude_db dBFS."""
-    shaped = generate_carrier(freq, n_total, sr, waveform, rng) * make_envelope(n_total, n_in, n_out)
+    shaped = generate_carrier(freqs, n_total, sr, waveform, rng, am_freq,
+                              am_depth) * make_envelope(n_total, n_in, n_out)
     target = db_to_lin(amplitude_db)
 
     if level_mode == "peak":
@@ -192,7 +204,9 @@ def default_filename(a: argparse.Namespace, dur: float, r_in: float, r_out: floa
     ramp = (f"{fmt_num(r_in)}msramp" if r_in == r_out
             else f"{fmt_num(r_in)}in{fmt_num(r_out)}outmsramp")
     ext = "mp3" if a.format == "mp3" else "wav"
-    return f"tone_{fmt_num(a.freq)}hz_{fmt_num(dur)}ms_{ramp}.{ext}"
+    freq_tag = "-".join(fmt_num(f) for f in a.freq)
+    am_tag = f"_am{fmt_num(a.am_freq)}hz" if a.am_freq is not None else ""
+    return f"tone_{freq_tag}hz_{fmt_num(dur)}ms_{ramp}{am_tag}.{ext}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -204,7 +218,9 @@ def parse_args() -> argparse.Namespace:
             "alone. --pad-pre/--pad-post add silence OUTSIDE that duration."
         ),
     )
-    p.add_argument("--freq", type=float, default=750.0, help="Carrier frequency in Hz")
+    p.add_argument("--freq", type=float, nargs="+", default=[750.0],
+                   help="Carrier frequency in Hz; give several to sum a multi-tone / "
+                        "harmonic complex (e.g. --freq 440 554 659)")
     p.add_argument("--duration", type=float, default=75.0,
                    help="TOTAL tone length in ms, including ramps")
     p.add_argument("--ramp", type=float, default=10.0, help="Onset AND offset ramp in ms")
@@ -216,6 +232,10 @@ def parse_args() -> argparse.Namespace:
                    help="Level in dBFS, negative; peak or RMS per --level-mode")
     p.add_argument("--level-mode", choices=["peak", "rms"], default="peak",
                    help="Interpret --amplitude as peak or RMS; use rms to loudness-match waveforms")
+    p.add_argument("--am-freq", type=float, default=None,
+                   help="Sinusoidal amplitude-modulation (SAM) rate in Hz; omit for no AM")
+    p.add_argument("--am-depth", type=float, default=1.0,
+                   help="AM modulation depth 0..1 (1 = full modulation)")
     p.add_argument("--sr", type=int, default=44100, help="Sample rate in Hz")
     p.add_argument("--bit-depth", type=int, choices=[16, 24], default=16, help="PCM bit depth")
     p.add_argument("--channels", type=int, choices=[1, 2], default=1,
@@ -232,6 +252,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--calibration-tone", action="store_true",
                    help="Also emit a 10 s steady tone (same freq/level/waveform) alongside "
                         "the normal output, named <output>_calib, for SPL/level metering")
+    p.add_argument("--metadata", action="store_true",
+                   help="Also write a .json file with parameters and timing")
     p.add_argument("--plot", action="store_true", help="Show envelope + spectrum after saving")
     p.add_argument("--out", type=str, default=None,
                    help="Output path (default: auto-named from freq/duration/ramp)")
@@ -245,10 +267,16 @@ def main() -> None:
 
     if a.amplitude > 0:
         sys.exit("Error: --amplitude must be <= 0 dBFS (0 dBFS is full scale).")
-    if a.freq <= 0:
-        sys.exit("Error: --freq must be positive.")
-    if a.freq >= a.sr / 2:
-        sys.exit(f"Error: --freq {a.freq:g} Hz is at or above Nyquist ({a.sr / 2:g} Hz).")
+    if any(f <= 0 for f in a.freq):
+        sys.exit("Error: every --freq must be positive.")
+    for f in a.freq:
+        if f >= a.sr / 2:
+            sys.exit(f"Error: --freq {f:g} Hz is at or above Nyquist ({a.sr / 2:g} Hz).")
+    if a.am_freq is not None:
+        if a.am_freq <= 0:
+            sys.exit("Error: --am-freq must be positive.")
+        if not 0.0 <= a.am_depth <= 1.0:
+            sys.exit("Error: --am-depth must be in [0, 1].")
     if min(a.ramp, a.ramp_in or 0, a.ramp_out or 0, a.pad_pre, a.pad_post) < 0:
         sys.exit("Error: ramp and pad values must be >= 0.")
 
@@ -274,14 +302,14 @@ def main() -> None:
         sys.exit(f"Error: --duration {dur:g} ms is under one sample at {a.sr} Hz.")
 
     tone = build_tone(a.freq, n_total, n_in, n_out, a.sr, a.waveform,
-                      a.amplitude, a.level_mode, rng)
+                      a.amplitude, a.level_mode, rng, a.am_freq, a.am_depth)
     mono = np.concatenate([np.zeros(n_pre), tone, np.zeros(n_post)])
 
     channels = 2 if a.sync_channel else a.channels
     if a.sync_channel:
         sync = np.concatenate([
             np.zeros(n_pre),
-            generate_carrier(a.freq, n_total, a.sr, "sine", rng) * db_to_lin(a.sync_level),
+            generate_carrier([a.freq[0]], n_total, a.sr, "sine", rng) * db_to_lin(a.sync_level),
             np.zeros(n_post),
         ])
         matrix = np.column_stack([mono, sync])
@@ -348,6 +376,8 @@ def main() -> None:
         "output_file": out_path,
         "parameters": {
             "freq_hz": a.freq,
+            "am_freq_hz": a.am_freq,
+            "am_depth": a.am_depth if a.am_freq is not None else None,
             "duration_ms_requested": dur,
             "duration_ms_actual": actual_dur_ms,
             "duration_samples": n_total,
@@ -380,14 +410,19 @@ def main() -> None:
         "note": "dB SPL/loudness is not set by this script -- it depends on playback "
                 "hardware and gain, and must be measured/calibrated externally.",
     }
-    sidecar = out_path.split(".")[0] + ".json"
-    with open(sidecar, "w") as f:
-        json.dump(meta, f, indent=2)
+    if a.metadata:
+        sidecar = out_path.split(".")[0] + ".json"
+        with open(sidecar, "w") as f:
+            json.dump(meta, f, indent=2)
 
     print("=" * 72)
     print("Tone generated")
     print(f"  output              : {out_path}")
-    print(f"  frequency           : {a.freq:g} Hz")
+    freq_str = ", ".join(f"{f:g}" for f in a.freq)
+    print(f"  frequency           : {freq_str} Hz"
+          + (f" ({len(a.freq)}-tone complex)" if len(a.freq) > 1 else ""))
+    if a.am_freq is not None:
+        print(f"  amplitude mod       : {a.am_freq:g} Hz SAM, depth {a.am_depth:g}")
     print(f"  waveform            : {a.waveform}"
           + (" (band-limited)" if a.waveform in ("square", "triangle") else ""))
     print(f"  duration            : {actual_dur_ms:.4f} ms actual / {dur:g} ms requested "
@@ -415,7 +450,7 @@ def main() -> None:
         calib_channels = a.channels
         n_calib = ms(10000.0)
         calib_tone = build_tone(a.freq, n_calib, n_in, n_out, a.sr, a.waveform,
-                                a.amplitude, a.level_mode, rng)
+                                a.amplitude, a.level_mode, rng, a.am_freq, a.am_depth)
         calib_matrix = (np.column_stack([calib_tone, calib_tone]) if calib_channels == 2
                         else calib_tone.reshape(-1, 1))
 
